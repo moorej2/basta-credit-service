@@ -1,4 +1,4 @@
-"""Leased, repeatable publication until MongoDB records a terminal outcome."""
+"""Publish durable outbox entries; confirmed messages belong to RabbitMQ."""
 
 import logging
 import signal
@@ -21,6 +21,7 @@ def dispatch_one(repo: CreditRepository, credit_id: str | None = None) -> bool:
         return False
     # A crash before OR after publish is safe: expiry permits republication.
     publish(record["_id"])
+    repo.mark_published(record["_id"], record["dispatch_token"])
     logger.info("credit_dispatched task_id=%s", record["_id"])
     return True
 

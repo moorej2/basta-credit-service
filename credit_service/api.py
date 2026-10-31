@@ -3,14 +3,18 @@ from contextlib import asynccontextmanager
 from typing import Annotated
 from uuid import uuid4
 
-from bson.decimal128 import Decimal128
 from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 from pymongo.errors import PyMongoError
 
 from credit_service.config import get_settings
-from credit_service.dispatch import dispatch_one
-from credit_service.models import CreditRequest, CreditResponse, UserResponse, money_string
+from credit_service.models import (
+    CreditRequest,
+    CreditResponse,
+    UserResponse,
+    money_string,
+    stored_money,
+)
 from credit_service.repository import CreditRepository, IdempotencyConflict
 
 logger = logging.getLogger(__name__)
@@ -43,10 +47,10 @@ def create_app(repository: CreditRepository | None = None) -> FastAPI:
     @app.exception_handler(PyMongoError)
     async def mongo_error(request, exc):
         logger.error("database_unavailable path=%s type=%s", request.url.path, type(exc).__name__)
-        return JSONResponse(
-            status_code=503,
-            content={"detail": "Database unavailable; retry safely using the same Idempotency-Key"},
-        )
+        detail = "Database unavailable"
+        if request.method == "POST" and request.url.path == "/credits":
+            detail += "; retry safely using the same Idempotency-Key"
+        return JSONResponse(status_code=503, content={"detail": detail})
 
     @app.get("/health/live")
     def live():
@@ -72,11 +76,7 @@ def create_app(repository: CreditRepository | None = None) -> FastAPI:
             record = repo.accept(body.user_id, body.amount, idempotency_key or str(uuid4()))
         except IdempotencyConflict as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        try:
-            dispatch_one(repo, record["_id"])
-        except Exception:
-            # Acceptance already committed. Don't report a rejection or lose work.
-            logger.exception("initial_dispatch_failed task_id=%s", record["_id"])
+        # MongoDB acceptance is enough. Only the dispatcher contacts the broker.
         response.headers["Location"] = f"/credits/{record['_id']}"
         logger.info("credit_accepted task_id=%s", record["_id"])
         return credit_response(record)
@@ -95,10 +95,10 @@ def create_app(repository: CreditRepository | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="User not found")
         return UserResponse(
             user_id=record["user_id"],
-            balance=money_string(record.get("balance", Decimal128("0")).to_decimal()),
+            balance=money_string(stored_money(record.get("balance", 0))),
             status=record["status"],
-            pending_credits=record["pending_credits"],
-            failed_credits=record["failed_credits"],
+            pending_credits=record.get("pending_credits", 0),
+            failed_credits=record.get("failed_credits", 0),
         )
 
     return app

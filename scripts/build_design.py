@@ -32,8 +32,8 @@ def build():
             fontSize=14,
             leading=18,
             textColor=colors.black,
-            spaceBefore=0,
-            spaceAfter=12,
+            spaceBefore=10,
+            spaceAfter=9,
         )
     )
     styles.add(

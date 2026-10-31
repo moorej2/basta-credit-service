@@ -1,57 +1,51 @@
 # Async credit processing service
 
-## Approach and request flow
+## Architecture
 
-I kept the API's job small: accept a credit, save it, and queue the work. FastAPI handles requests, RabbitMQ holds tasks, and Celery runs the worker. MongoDB stores balances and tracks each credit.
+FastAPI accepts requests, RabbitMQ holds tasks, and a Celery worker applies credits in MongoDB. A separate dispatcher moves saved work into the queue. I kept the request path independent of RabbitMQ so a broker outage does not hold up API responses.
 
-The main concern was retries. If a task runs twice, the user should still receive the money only once.
+### Request flow
 
-### What happens to a request
+1. `POST /credits` validates the user and amount. One transaction saves the credit and sets the user to `processing`, then the API returns **202 Accepted** with a task ID.
+2. The dispatcher claims a saved credit, publishes its ID, and records RabbitMQ's confirmation. Confirmed messages stay in the queue without being republished just because they are waiting.
+3. The worker checks the credit, increments the balance, and marks it `processed` in one transaction. Repeating a completed task leaves the balance alone.
+4. GET endpoints expose the credit outcome and user balance. A user stays `processing` while any accepted credits remain pending.
 
-1. The client sends `POST /credits` with a user ID and amount. The API validates it, saves a credit record, and sets the user to `processing`.
-2. The API attempts to queue the credit ID and returns **202 Accepted**, with an ID for checking progress. It does not wait for the balance update.
-3. The worker checks the credit. If it is pending, it adds the amount and marks the credit `processed` in the same MongoDB transaction.
-4. GET endpoints let the client check a credit or a user's balance. When credits overlap, the user stays `processing` until the pending work finishes.
+I kept two collections:
 
-### Why keep a separate credit record
+- **Users:** a unique user ID, Decimal128 balance, status, and pending/failed counts.
+- **Credits:** an ID, unique idempotency key, user ID, amount, status, timestamps, dispatch state/lease, and publication and execution counters.
 
-The balance alone cannot tell the worker whether it has already handled a task. A credit record can. Updating both together also handles a crash after the database commits: the next attempt sees that the credit is complete and leaves the balance alone.
+An index on status, dispatch state, and next dispatch time supports the outbox scan.
 
-The record also holds the client's `Idempotency-Key`. Reusing a key returns the original credit; changing the amount or user returns a conflict. The header is optional, but clients need it to retry requests safely.
+## Key design decisions
 
-### Assumptions
+The separate credit record answers a question the balance cannot: has this operation already been applied? Updating both records together makes a retry safe even if the worker crashes after committing. A repeated `Idempotency-Key` returns the original credit; changed request data returns a conflict.
 
-- One currency, positive amounts, and no fractions smaller than a cent. `Decimal` and `Decimal128` preserve money values.
-- Unknown users are created automatically. The worker creates a missing balance field on the first credit.
-- A 202 response means the credit was saved, not that the balance has changed.
+Amounts use `Decimal` and `Decimal128`, with strings in JSON responses to preserve decimal values. The assumption is one currency with cent precision. Unknown users are created. Existing numeric balances and missing counters are supported, although converting an old double cannot recover precision already lost.
 
 <!-- PAGE BREAK -->
 
-## Recovery testing and trade-offs
+## Implementation approach
 
-### What if the queue is unavailable
+The credit record also serves as a transactional outbox: accepting a request saves the obligation to publish it. Publishing only inside the request would leave a crash window between saving and queuing. A flag on the user would be less useful when several credits overlap.
 
-Saving to MongoDB and publishing to RabbitMQ are separate steps. A crash between them could otherwise leave a saved credit with no task in the queue.
+Unconfirmed publication backs off from 30 seconds to a maximum of five minutes. A lease token prevents a late publisher from overwriting a retry already scheduled by a fast worker. Duplicates remain possible if publication succeeds but saving its confirmation fails; the worker's transaction handles them.
 
-I added a dispatcher that finds pending credits and republishes them after a 30-second lease expires. It can publish duplicates, so the worker still needs its transaction check. MongoDB holds the actual outcome; a Celery task ID does not prevent duplicate credits.
+Actual execution errors have a separate budget. Unexpected exceptions and non-transient database errors retry with increasing delays, then pause as `failed` after five recorded failures. Waiting in a queue never counts as a failure. Infrastructure and uncertain-commit errors do not consume that budget. If MongoDB cannot save retry intent, Celery retries through RabbitMQ; if that also fails, the original delivery is requeued.
 
-Connection and temporary transaction failures retry. Non-transient database errors are marked `failed` if the database can save that outcome. Unexpected errors stay pending and are logged. A CLI command lets an operator requeue failures after fixing the cause.
+Each worker process lazily reuses its own MongoDB client. Docker Compose configures the services and MongoDB replica set; the README contains run and test commands. Operators can inspect pending work and explicitly requeue failed credits after fixing the cause.
 
-### Tests I focused on
+## Testing strategy
 
-Beyond validation and the normal request flow, I focused on cases that could produce the wrong balance:
+The tests concentrate on cases that could change money or lose accepted work:
 
-- Running the same credit repeatedly, including concurrent attempts.
-- Applying different credits to one user without losing an update.
-- Failing between the balance update and completion record, then checking rollback.
-- Recovering failed publication and keeping status correct when credits overlap.
+- Duplicate tasks, overlapping credits, and rollback between the balance update and completion record.
+- Seeded integer/double balances and user documents without counters.
+- Publication backoff, queue backlog, stale lease tokens, and a worker retry racing publisher confirmation.
+- Repeated programming errors, transient database failures, and an error reported after a successful commit.
+- CLI recovery, dispatcher shutdown, readiness errors, and a complete HTTP-to-worker flow with real dependencies.
 
-All **34 tests passed**, including an end-to-end test with real MongoDB, RabbitMQ, and Celery. Worker and broker stop-and-restart checks also passed. Replaying a committed credit was tested; killing a worker at the exact commit boundary was not.
+The latest results are in `docs/VERIFICATION.md`. Live stop-and-restart checks cover the worker and broker; an OS-level kill at the exact commit boundary remains untested.
 
-### Running it and what I would change next
-
-Docker Compose starts the services together so reviewers do not need to configure each dependency. MongoDB uses a single-node replica set for transactions. The README includes startup, sample requests, and test commands.
-
-The dispatcher is the main trade-off: recovery is simple, but waiting tasks can get published again. With more traffic, I would measure queue age and duplicate dispatches before adjusting that policy and adding admission limits.
-
-Before using this for real account balances, I would add account authorization, managed secrets, tested backups, and reconciliation. I would also test database failover and sustained load. Those are outside this local exercise's scope.
+For a real launch, I would add account authorization, managed secrets, tested restores, and reconciliation. Confirmed work assumes RabbitMQ retains its persistent data; catastrophic broker data loss needs reconciliation of sent-but-unprocessed credits. Load testing, admission limits, and database failover testing are further work.

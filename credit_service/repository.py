@@ -27,7 +27,7 @@ class CreditRepository:
             settings.mongo_uri,
             serverSelectionTimeoutMS=settings.mongo_timeout_ms,
             connectTimeoutMS=settings.mongo_timeout_ms,
-            socketTimeoutMS=10000,
+            socketTimeoutMS=settings.mongo_socket_timeout_ms,
             tz_aware=True,
         )
         self.db = self.client[settings.mongo_database]
@@ -42,7 +42,9 @@ class CreditRepository:
             raise RuntimeError("MongoDB must run as a replica set for transactions")
         self.users.create_index("user_id", unique=True)
         self.credits.create_index("idempotency_key", unique=True)
-        self.credits.create_index([("status", ASCENDING), ("next_dispatch_at", ASCENDING)])
+        self.credits.create_index(
+            [("status", ASCENDING), ("dispatch_state", ASCENDING), ("next_dispatch_at", ASCENDING)]
+        )
 
     def transaction(self, callback):
         with self.client.start_session() as session:
@@ -77,6 +79,10 @@ class CreditRepository:
                 "updated_at": now,
                 "next_dispatch_at": now,
                 "dispatch_count": 0,
+                "dispatch_attempts": 0,
+                "dispatch_state": "pending",
+                "failure_count": 0,
+                "retry_count": 0,
             }
             self.credits.insert_one(record, session=session)
             self.users.update_one(
@@ -114,21 +120,119 @@ class CreditRepository:
 
     def claim_dispatch(self, credit_id: str | None = None):
         now = datetime.now(UTC)
-        query = {"status": "processing", "next_dispatch_at": {"$lte": now}}
+        query = {
+            "status": "processing",
+            "dispatch_state": {"$ne": "sent"},
+            "next_dispatch_at": {"$lte": now},
+        }
         if credit_id is not None:
             query["_id"] = credit_id
+        attempts = {"$min": [{"$ifNull": ["$dispatch_attempts", 0]}, 16]}
+        delay_seconds = {
+            "$min": [
+                self.settings.dispatch_backoff_max_seconds,
+                {"$multiply": [self.settings.dispatch_lease_seconds, {"$pow": [2, attempts]}]},
+            ]
+        }
         return self.credits.find_one_and_update(
             query,
-            {
-                "$set": {
-                    "next_dispatch_at": now
-                    + timedelta(seconds=self.settings.dispatch_lease_seconds)
-                },
-                "$inc": {"dispatch_count": 1},
-            },
+            [
+                {
+                    "$set": {
+                        "next_dispatch_at": {"$add": [now, {"$multiply": [1000, delay_seconds]}]},
+                        "dispatch_count": {"$add": [{"$ifNull": ["$dispatch_count", 0]}, 1]},
+                        "dispatch_attempts": {"$add": [{"$ifNull": ["$dispatch_attempts", 0]}, 1]},
+                        "dispatch_token": str(uuid4()),
+                    }
+                }
+            ],
             sort=[("next_dispatch_at", ASCENDING)],
             return_document=ReturnDocument.AFTER,
         )
+
+    def mark_published(self, credit_id: str, token: str) -> bool:
+        # A fast worker may already have completed or scheduled a retry. A stale
+        # publisher must never overwrite that newer state.
+        result = self.credits.update_one(
+            {"_id": credit_id, "status": "processing", "dispatch_token": token},
+            {
+                "$set": {"dispatch_state": "sent", "dispatch_attempts": 0},
+                "$unset": {"dispatch_token": ""},
+            },
+        )
+        return result.modified_count == 1
+
+    def _finish_user(self, credit: dict, now: datetime, error: str | None, session):
+        increments = {"pending_credits": -1}
+        increments["balance" if error is None else "failed_credits"] = (
+            credit["amount"] if error is None else 1
+        )
+        result = self.users.update_one(
+            {"user_id": credit["user_id"], "pending_credits": {"$gt": 0}},
+            {"$inc": increments, "$set": {"updated_at": now}},
+            session=session,
+        )
+        if result.matched_count != 1:
+            raise RuntimeError("Credit has no user with a pending operation")
+        self.users.update_one(
+            {"user_id": credit["user_id"]},
+            [
+                {
+                    "$set": {
+                        "status": {
+                            "$cond": [
+                                {"$gt": ["$pending_credits", 0]},
+                                "processing",
+                                {"$cond": [{"$gt": ["$failed_credits", 0]}, "failed", "processed"]},
+                            ]
+                        }
+                    }
+                }
+            ],
+            session=session,
+        )
+
+    def defer(self, credit_id: str, error: str, *, count_failure: bool) -> str:
+        """Persist retry intent or park repeated execution errors, never queue age.
+
+        Reading and writing the credit in this transaction also arbitrates with
+        an uncertain/parallel successful commit. Processed money is never reopened.
+        """
+        now = datetime.now(UTC)
+
+        def save(session):
+            credit = self.credits.find_one({"_id": credit_id}, session=session)
+            if credit is None or credit["status"] != "processing":
+                return "terminal"
+            failures = credit.get("failure_count", 0) + int(count_failure)
+            retries = credit.get("retry_count", 0) + 1
+            parked = failures >= self.settings.task_max_failures
+            delay = min(
+                self.settings.task_retry_max_seconds,
+                self.settings.task_retry_base_seconds * 2 ** min(retries - 1, 16),
+            )
+            if parked:
+                self._finish_user(credit, now, error, session)
+            self.credits.update_one(
+                {"_id": credit_id},
+                {
+                    "$set": {
+                        "status": "failed" if parked else "processing",
+                        "dispatch_state": "pending",
+                        "dispatch_attempts": 0,
+                        "failure_count": failures,
+                        "retry_count": retries,
+                        "error": error,
+                        "updated_at": now,
+                        "next_dispatch_at": now + timedelta(seconds=delay),
+                    },
+                    "$unset": {"dispatch_token": ""},
+                },
+                session=session,
+            )
+            return "failed" if parked else "retry"
+
+        return self.transaction(save)
 
     def finish(self, credit_id: str, *, error: str | None = None) -> bool:
         """Atomically apply once, or record a permanent failure without adding money."""
@@ -138,40 +242,7 @@ class CreditRepository:
             credit = self.credits.find_one({"_id": credit_id}, session=session)
             if credit is None or credit["status"] != "processing":
                 return False
-            increments = {"pending_credits": -1}
-            if error is None:
-                increments["balance"] = credit["amount"]
-            else:
-                increments["failed_credits"] = 1
-            self.users.update_one(
-                {"user_id": credit["user_id"]},
-                {"$inc": increments, "$set": {"updated_at": now}},
-                session=session,
-            )
-            # A pipeline computes aggregate status from the UPDATED counters.
-            self.users.update_one(
-                {"user_id": credit["user_id"]},
-                [
-                    {
-                        "$set": {
-                            "status": {
-                                "$cond": [
-                                    {"$gt": ["$pending_credits", 0]},
-                                    "processing",
-                                    {
-                                        "$cond": [
-                                            {"$gt": ["$failed_credits", 0]},
-                                            "failed",
-                                            "processed",
-                                        ]
-                                    },
-                                ]
-                            }
-                        }
-                    }
-                ],
-                session=session,
-            )
+            self._finish_user(credit, now, error, session)
             self.credits.update_one(
                 {"_id": credit_id},
                 {
@@ -202,7 +273,12 @@ class CreditRepository:
                         "error": None,
                         "next_dispatch_at": now,
                         "updated_at": now,
-                    }
+                        "dispatch_state": "pending",
+                        "dispatch_attempts": 0,
+                        "failure_count": 0,
+                        "retry_count": 0,
+                    },
+                    "$unset": {"dispatch_token": ""},
                 },
                 session=session,
             )

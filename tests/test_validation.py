@@ -26,3 +26,11 @@ def test_preserves_decimal_precision():
 def test_rejects_unexpected_fields():
     with pytest.raises(ValidationError):
         CreditRequest(user_id="u_123", amount="1", admin=True)
+
+
+@pytest.mark.parametrize("value", [True, "150.00", None, float("nan"), float("inf")])
+def test_stored_money_rejects_corrupt_values(value):
+    from credit_service.models import stored_money
+
+    with pytest.raises(ValueError):
+        stored_money(value)

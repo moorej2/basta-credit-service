@@ -1,7 +1,9 @@
 # Verification evidence
 
-Verified locally on October 31, 2026. These are actual local results, not a claim
-of a production deployment or a successful remote GitHub Actions run.
+Verified locally on October 31, 2026 after the outbox/retry corrections. These
+are local results, not a production deployment. Remote runs are available in
+[GitHub Actions](https://github.com/moorej2/basta-credit-service/actions/workflows/ci.yml);
+check the run for the commit being reviewed.
 
 ## Checks executed
 
@@ -9,9 +11,9 @@ of a production deployment or a successful remote GitHub Actions run.
 | --- | --- |
 | `ruff check .` | Passed |
 | `ruff format --check .` | Passed |
-| Unit tests without infrastructure | 16 passed, 18 deselected |
+| Unit tests without infrastructure | 31 passed, 40 deselected |
 | Compose startup with build and readiness checks | Passed |
-| Full Docker-backed suite | 34 passed in 3.04 seconds, excluding build/startup time |
+| Full Docker-backed suite | 71 passed in 8.38 seconds, excluding build/startup time |
 | Live worker-stop and restart exercise | Passed |
 | Live RabbitMQ-stop and restart exercise | Passed |
 | Two-page design PDF | Exactly 2 pages; both rendered pages visually inspected |
@@ -36,7 +38,7 @@ Executed `scripts/check_recovery.py` against the running local stack:
 2. Restarted the worker. The credit completed. Repeating the same idempotency key
    returned the same credit ID and left the balance at 1.25.
 3. Stopped RabbitMQ and submitted a second credit of 1.25. The API returned 202
-   in approximately 0.03 seconds in this run. This is one observation, not a
+   in approximately 0.01 seconds in this run. This is one observation, not a
    latency benchmark or a hard response-time guarantee.
 4. Restarted RabbitMQ. The existing worker reconnected and the dispatcher
    recovered the pending credit. The final balance was exactly 2.50, status
@@ -44,24 +46,39 @@ Executed `scripts/check_recovery.py` against the running local stack:
 
 Recorded identifiers for the recovery run:
 
-- User: `recovery_bc2dcb2195544f14a6ac7c6c9919867c`
-- Worker restart credit: `3ffe8850-0fc9-4681-b209-e44a111dc23f`
-- Broker outage credit: `39e8757b-6639-475f-b811-9c54bded36fa`
+- User: `recovery_3102a6865fcb434e9225747ddd40a30b`
+- Worker restart credit: `63c1ee9c-9687-4b71-a8cd-09b2482184ea`
+- Broker outage credit: `29c6b951-3ccd-45cc-8456-b5169dbb5c13`
 
 The script restores both services in a finally block and leaves the demo running.
 
-## Tests with injected failures
+## Regression and failure coverage
 
-- Raised an exception after the balance update but before the completion write:
-  MongoDB rolled back the money and pending-count changes.
-- Replayed an already committed operation: balance stayed unchanged.
-- Executed a credit concurrently from eight threads: exactly one application.
-- Submitted and processed 16 distinct credits concurrently for a new user:
-  total balance and pending count remained correct.
-- Failed publication after acquiring a dispatch lease, expired the lease, and
-  verified the next dispatch attempt published the same operation ID.
-- Verified permanent-failure status, counter transitions, and explicit requeue.
-- Verified task retry classification and connection cleanup with unit tests.
+- Numeric BSON double/integer/Decimal128 balances, absent balance fields, and
+  missing counters can be read; credits apply to legacy numeric balances.
+- Repeated and concurrent requests/tasks preserve the exact balance and counters.
+- An exception between balance mutation and completion rolls back the transaction.
+- Confirmed messages are not republished while waiting in a queue. Unconfirmed
+  publication backs off to a cap without declaring a waiting credit failed.
+- Lease tokens reject stale publication acknowledgments and protect a retry
+  recorded by a worker before publication confirmation is saved.
+- Repeated actual execution errors park a credit; requeue resets its budget.
+  A real MongoDB invalid-balance error exercises the complete task handler.
+- Infrastructure and write-concern/uncertain-commit errors preserve the failure
+  budget. A simulated lost reply after a real commit cannot change the balance
+  or reclassify the operation as failed.
+- When retry intent cannot be persisted, Celery schedules a broker retry. The
+  real Celery retry implementation is exercised with a failed publish; the
+  original delivery is rejected with requeue enabled.
+- The failure transition racing a successful transaction leaves one consistent
+  outcome; a missing user cannot produce a false processed marker.
+- Worker clients are reused within a process, recreated after a PID change, and
+  closed at worker shutdown.
+- Dispatcher tests cover idle waiting, recovery after an exception, signal-driven
+  shutdown, and client cleanup. CLI tests cover status/age, successful recovery,
+  refusing processed operations, missing arguments, and cleanup.
+- Readiness failures return 503 without POST-specific idempotency advice. API
+  acceptance does not contact RabbitMQ.
 
 ## Boundaries of the evidence
 

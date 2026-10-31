@@ -1,4 +1,5 @@
 import pytest
+from bson.decimal128 import Decimal128
 from fastapi.testclient import TestClient
 from pymongo.errors import AutoReconnect
 
@@ -8,8 +9,7 @@ pytestmark = pytest.mark.integration
 
 
 @pytest.fixture
-def client(repo, monkeypatch):
-    monkeypatch.setattr("credit_service.api.dispatch_one", lambda *args: False)
+def client(repo):
     with TestClient(create_app(repo)) as test_client:
         yield test_client
 
@@ -39,7 +39,7 @@ def test_api_keeps_accepted_work_when_publish_fails(client, repo, monkeypatch):
     def broker_down(*args):
         raise ConnectionError("broker unavailable")
 
-    monkeypatch.setattr("credit_service.api.dispatch_one", broker_down)
+    monkeypatch.setattr("credit_service.dispatch.publish", broker_down)
     response = client.post("/credits", json={"user_id": "u_123", "amount": "1.00"})
     assert response.status_code == 202
     assert repo.get_credit(response.json()["task_id"])["status"] == "processing"
@@ -66,3 +66,33 @@ def test_database_unavailable_does_not_claim_acceptance(client, repo, monkeypatc
 
     monkeypatch.setattr(repo, "accept", unavailable)
     assert client.post("/credits", json={"user_id": "u", "amount": 1}).status_code == 503
+
+
+@pytest.mark.parametrize("balance", [150.0, 150, Decimal128("150.00")])
+def test_spec_shaped_seeded_users_can_be_read(client, repo, balance):
+    repo.users.insert_one({"user_id": "seeded", "balance": balance, "status": "processed"})
+    response = client.get("/users/seeded")
+    assert response.status_code == 200
+    assert response.json() == {
+        "user_id": "seeded",
+        "balance": "150.00",
+        "status": "processed",
+        "pending_credits": 0,
+        "failed_credits": 0,
+    }
+
+
+def test_seeded_user_without_balance_reads_as_zero(client, repo):
+    repo.users.insert_one({"user_id": "seeded", "status": "processed"})
+    assert client.get("/users/seeded").json()["balance"] == "0.00"
+
+
+def test_readiness_database_error_does_not_advise_request_idempotency(client, repo, monkeypatch):
+    from unittest.mock import Mock
+
+    monkeypatch.setattr(repo, "client", Mock())
+    repo.client.admin.command.side_effect = AutoReconnect("down")
+    response = client.get("/health/ready")
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Database unavailable"}
+    assert client.get("/health/live").status_code == 200

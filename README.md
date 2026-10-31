@@ -1,5 +1,7 @@
 # Async credit processing service
 
+[![CI](https://github.com/moorej2/basta-credit-service/actions/workflows/ci.yml/badge.svg)](https://github.com/moorej2/basta-credit-service/actions/workflows/ci.yml)
+
 A small FastAPI service that accepts a credit, returns `202 Accepted`, and uses
 RabbitMQ and a Celery worker to update a MongoDB balance asynchronously.
 MongoDB transactions keep the credit outcome and balance consistent. Durable
@@ -49,6 +51,11 @@ decimal values. A missing MongoDB `balance` field is created by the worker's
 `$inc`. Repeating the same request with the same key returns the original credit
 without adding money again. Use a new key to request another credit.
 
+Existing spec-shaped user documents with BSON double/integer balances and missing
+counters can be read and credited; missing counters default to zero. Legacy
+doubles are converted for display, which cannot recover precision already lost
+when the double was stored. New credit amounts use Decimal128 throughout.
+
 ## API contract
 
 | Endpoint | Behavior |
@@ -72,14 +79,32 @@ a different user or amount returns 409. Without a key, every call is a new credi
 safe recovery from an ambiguous HTTP outcome requires a caller-supplied key.
 A replay returns the original ID and current status, still with HTTP 202.
 
-A 202 means the operation is committed to MongoDB, not that money has been
-applied. Publication is attempted before responding; if the broker is down,
-acceptance still succeeds and the dispatcher retries after the lease expires.
+A 202 means the operation and its dispatch intent are committed to MongoDB, not
+that money has been applied. Only the dispatcher contacts RabbitMQ; an API request
+never waits for broker connection or publisher confirmation. During a broker
+outage, credits remain durably pending until publication succeeds.
 Database failures return 503; a client must reuse its key because a commit may
 have succeeded before the connection was interrupted. Requests wait for database
-acceptance and an initial publication attempt, never for worker completion.
+acceptance, never for broker publication or worker completion.
 PyMongo's transaction retries may extend request time during contention/outages;
 this demo has connection/socket limits, not a hard end-to-end HTTP deadline.
+
+## Retry and timeout settings
+
+Compose accepts these values through `.env` or exported environment variables:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `CREDIT_DISPATCH_LEASE_SECONDS` | 30 | Initial delay before another unconfirmed publication attempt |
+| `CREDIT_DISPATCH_BACKOFF_MAX_SECONDS` | 300 | Maximum publication retry delay |
+| `CREDIT_TASK_RETRY_BASE_SECONDS` | 2 | Initial stored execution retry delay |
+| `CREDIT_TASK_RETRY_MAX_SECONDS` | 60 | Maximum execution retry delay |
+| `CREDIT_TASK_MAX_FAILURES` | 5 | Actual non-infrastructure failures before operator review |
+| `CREDIT_MONGO_TIMEOUT_MS` | 3000 | Server selection and connection timeout |
+| `CREDIT_MONGO_SOCKET_TIMEOUT_MS` | 10000 | Socket operation timeout |
+
+These are individual operation limits, not a hard HTTP deadline. Database driver
+transaction retries can extend request latency.
 
 ## Verify
 
@@ -90,7 +115,10 @@ docker compose --profile test run --build --rm test
 ```
 
 This executes validation, API, transactional integration, concurrency, failure
-injection, dispatch recovery, and end-to-end tests. Database integration tests use
+injection, dispatch recovery, and end-to-end tests. Regression tests also cover
+legacy numeric balances, health failures, process-local client reuse, outbox
+confirmation races, poison credits, retry classification, operator CLI behavior,
+and dispatcher shutdown/recovery. Database integration tests use
 unique disposable database names and do not drop the application's database.
 The end-to-end test adds an isolated `e2e_...` user to the running application.
 
@@ -128,12 +156,14 @@ does the same with development extras. To intentionally refresh them, install
 ## Architecture and code map
 
 1. The API transaction creates a credit and increments the user's pending count.
-2. The API attempts publication with the credit ID. The dispatcher also polls
-   pending credits and atomically claims expiring dispatch leases.
+2. The dispatcher polls the durable dispatch intent, claims an expiring lease,
+   and publishes the credit ID. Publisher confirmation marks that intent sent;
+   queued credits are not republished simply because they are still processing.
 3. RabbitMQ delivers a persistent JSON task to Celery; publisher confirms are enabled.
 4. The worker transaction checks the credit, increments `balance`, decrements the
    pending count, computes aggregate status, and marks the credit processed.
 5. Duplicate workers see a completed credit after transaction retry and do nothing.
+   Each worker process lazily reuses its own MongoDB connection pool.
 
 | File | Responsibility |
 | --- | --- |
@@ -142,7 +172,7 @@ does the same with development extras. To intentionally refresh them, install
 | `credit_service/repository.py` | Transactions, uniqueness, status, dispatch leases |
 | `credit_service/celery_app.py` | Queue, acknowledgment, serialization configuration |
 | `credit_service/tasks.py` | Worker execution and transient failure handling |
-| `credit_service/dispatch.py` | Initial publication and durable periodic recovery |
+| `credit_service/dispatch.py` | Confirmed outbox publication and backoff after interrupted dispatch |
 | `credit_service/admin.py` | Queue age/count inspection and explicit failed-credit recovery |
 
 The stable task ID is a correlation ID, **not** a Celery deduplication mechanism.
@@ -166,8 +196,10 @@ docker compose start worker
 ```
 
 To demonstrate broker recovery, stop `rabbitmq`, submit a new credit (202), then
-start `rabbitmq`. Within the 30-second lease plus polling/processing time, the
-dispatcher republishes it. Keep the API/dispatcher running during this exercise.
+start `rabbitmq`. The dispatcher retries failed publication with increasing
+leases: 30, 60, 120, 240, then at most 300 seconds by default. A fresh credit
+usually gets its first publication attempt within the two-second polling interval.
+Keep the API/dispatcher running during this exercise.
 Worker connection recovery can add broker reconnect delay. Publication retries
 and processing retries are separate mechanisms.
 
@@ -182,12 +214,25 @@ acceptance and the exact recovered balance, then leaves both services running.
 Use it only when you are ready to interrupt this local demo stack. If using a
 non-default port, export `CREDIT_API_PORT` before running the script.
 
-Transient connection and transaction failures retry with delay; connection
-failures use jitter and a capped exponential delay. They are not automatically
-declared permanent simply because an outage lasts a long time. A non-transient
-MongoDB operation error is recorded as `failed` when MongoDB can persist that
-outcome. Unexpected task errors remain pending for recovery and produce error logs.
-Alert on old pending credits, failed credits, and repeated task/publish errors.
+Task errors persist delayed retry intent in MongoDB, so publication and execution
+retries have separate counters. Task retry delays double from 2 to at most 60
+seconds. Connection failures, write-concern errors, uncertain commits, and known
+transient database codes do not consume the failure budget. They can retry for
+as long as infrastructure is unavailable.
+
+Unexpected exceptions and other database operation errors consume the actual
+execution-failure budget. After five recorded failures (configurable), the credit
+is parked as `failed` and the user's counters are updated in the same transaction.
+Dispatch attempts and time waiting in a queue never count toward that limit.
+A failure recorded after an ambiguous successful commit sees `processed` and
+cannot reopen or reclassify the credit.
+
+If MongoDB cannot persist retry intent, Celery schedules a broker retry with
+jitter. If that publication also fails, the original delivery is rejected with
+requeue enabled rather than acknowledged. This can cause repeated redelivery
+while both dependencies are down; alert and restore infrastructure rather than
+expect a terminal business failure. Alert on oldest pending age, failed credits,
+and repeated task/publish errors.
 
 After diagnosing and fixing a failed operation's cause:
 
@@ -196,7 +241,8 @@ docker compose exec api python -m credit_service.admin requeue REPLACE_WITH_TASK
 ```
 
 Recovery adjusts the failed/pending counters transactionally and preserves the
-original credit ID. It never reopens an already processed credit.
+original credit ID, resets its failure budget, and schedules fresh dispatch. It
+never reopens an already processed credit.
 
 Aggregate user status is `processing` while any credits are pending, otherwise
 `failed` while unresolved failed credits exist, otherwise `processed`. A failed
@@ -213,11 +259,18 @@ MongoDB and RabbitMQ volumes. Do not use it when you need the demo data.
 
 ## Scope and trade-offs
 
-The replayable credit record is a compact outbox/work queue. It republishes pending
-work every lease period until a terminal outcome, including tasks that are merely
-waiting in RabbitMQ. This deliberately trades extra duplicate messages for recovery
-from publish/crash uncertainty. At larger scale, add bounded admission, dispatch
-backoff, queue-age alarms, and separate acknowledged-outbox/reconciliation policies.
+The credit record doubles as a transactional outbox: saving a request also saves
+the obligation to publish it. After RabbitMQ confirms a persistent message, the
+dispatcher stops publishing that operation. Celery's late acknowledgment handles
+worker loss. A crash between confirmation and saving the sent marker can still
+produce a duplicate after lease expiry; transactional application makes it safe.
+Lease tokens prevent a late publisher from overwriting a worker's newer retry.
+
+Backlog alone does not generate extra copies. Failed publication backs off and
+repeated execution errors are parked for operator review. A catastrophic loss of
+RabbitMQ's persistent data after confirmation still requires reconciliation of
+sent-but-unprocessed operations. Automatic disaster recovery, queue admission
+limits, and a full audited ledger are outside this exercise's scope.
 
 Single-node MongoDB and RabbitMQ are development topology, not high availability.
 Container image tags track patch updates; dependency locks do not pin base image

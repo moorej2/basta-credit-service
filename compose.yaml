@@ -9,6 +9,12 @@ x-app: &app
     CREDIT_MONGO_DATABASE: credits
     CREDIT_BROKER_URL: amqp://credits:credits@rabbitmq:5672//
     CREDIT_DISPATCH_LEASE_SECONDS: ${CREDIT_DISPATCH_LEASE_SECONDS:-30}
+    CREDIT_DISPATCH_BACKOFF_MAX_SECONDS: ${CREDIT_DISPATCH_BACKOFF_MAX_SECONDS:-300}
+    CREDIT_TASK_RETRY_BASE_SECONDS: ${CREDIT_TASK_RETRY_BASE_SECONDS:-2}
+    CREDIT_TASK_RETRY_MAX_SECONDS: ${CREDIT_TASK_RETRY_MAX_SECONDS:-60}
+    CREDIT_TASK_MAX_FAILURES: ${CREDIT_TASK_MAX_FAILURES:-5}
+    CREDIT_MONGO_TIMEOUT_MS: ${CREDIT_MONGO_TIMEOUT_MS:-3000}
+    CREDIT_MONGO_SOCKET_TIMEOUT_MS: ${CREDIT_MONGO_SOCKET_TIMEOUT_MS:-10000}
   depends_on:
     mongo-init:
       condition: service_completed_successfully
@@ -64,6 +70,9 @@ services:
 
   api:
     <<: *app
+    depends_on:
+      mongo-init:
+        condition: service_completed_successfully
     ports: ["127.0.0.1:${CREDIT_API_PORT:-8000}:8000"]
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/ready', timeout=5)"]

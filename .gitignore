@@ -9,3 +9,5 @@ tmp/
 dist/
 tmp-*.log
 /video/
+
+.DS_Store
