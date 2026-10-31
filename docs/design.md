@@ -1,53 +1,57 @@
 # Async credit processing service
 
-## Architecture and key decisions
+## Approach and request flow
 
-Accept credits durably and apply them asynchronously. **Each credit changes the balance at most once**, even when requests or tasks repeat. MongoDB owns balances and operation state; RabbitMQ transports work; Celery executes it.
+I kept the API's job small: accept a credit, save it, and queue the work. FastAPI handles requests, RabbitMQ holds tasks, and Celery runs the worker. MongoDB stores balances and tracks each credit.
 
-### Request flow
+The main concern was retries. If a task runs twice, the user should still receive the money only once.
 
-1. **Validate and accept.** FastAPI validates `POST /credits`. One MongoDB transaction creates the credit, increments the user's pending count, and sets status to `processing`.
-2. **Publish and respond.** The API attempts publication, then returns **202 Accepted**, a stable `task_id`, and a `Location`. It does not wait for worker completion.
-3. **Recover dispatch.** A separate dispatcher claims expiring leases on pending credits and republishes work after failed or interrupted publication.
-4. **Apply and observe.** The worker atomically increments `balance`, updates counters/status, and marks the credit `processed`. GET endpoints expose individual outcomes and user balances.
+### What happens to a request
 
-### Data model and design rationale
+1. The client sends `POST /credits` with a user ID and amount. The API validates it, saves a credit record, and sets the user to `processing`.
+2. The API attempts to queue the credit ID and returns **202 Accepted**, with an ID for checking progress. It does not wait for the balance update.
+3. The worker checks the credit. If it is pending, it adds the amount and marks the credit `processed` in the same MongoDB transaction.
+4. GET endpoints let the client check a credit or a user's balance. When credits overlap, the user stays `processing` until the pending work finishes.
 
-- **Two collections.** Users hold balances and pending/failed counters. Credits hold request identity, amount, status, timestamps, dispatch lease, and error. No separate Celery result backend is needed.
-- **Database constraints.** Unique user IDs and idempotency keys prevent races. A status/dispatch-time index supports pending-work scans.
-- **Exact money values.** Python `Decimal` and BSON `Decimal128` preserve decimal arithmetic. Responses use decimal strings; `$inc` creates a missing balance field.
-- **Atomic completion.** Snapshot reads and majority writes couple money with the processed marker. Retriable transaction callbacks contain only database work. Worker clients are created after Celery forks.
+### Why keep a separate credit record
 
-### API assumptions and status semantics
+The balance alone cannot tell the worker whether it has already handled a task. A credit record can. Updating both together also handles a crash after the database commits: the next attempt sees that the credit is complete and leaves the balance alone.
 
-- **Amounts:** one fixed currency; positive, finite, at most two decimal places; maximum one billion major units. Unknown users are created.
-- **Request retries:** `Idempotency-Key` returns the original credit. Changed data with the same key returns **409**; invalid input returns **422**. Without a key, each call creates a new credit.
-- **User status:** `processing` while credits are pending; otherwise `failed` if unresolved failures remain; otherwise `processed`. Each credit retains its own outcome.
+The record also holds the client's `Idempotency-Key`. Reusing a key returns the original credit; changing the amount or user returns a conflict. The header is optional, but clients need it to retry requests safely.
+
+### Assumptions
+
+- One currency, positive amounts, and no fractions smaller than a cent. `Decimal` and `Decimal128` preserve money values.
+- Unknown users are created automatically. The worker creates a missing balance field on the first credit.
+- A 202 response means the credit was saved, not that the balance has changed.
 
 <!-- PAGE BREAK -->
 
-## Reliability testing and delivery
+## Recovery testing and trade-offs
 
-### Failure handling and recovery
+### What if the queue is unavailable
 
-- **Publication gap.** Pending credits double as durable dispatch records. The API publishes initially; the dispatcher republishes after a **30-second lease** expires, recovering interrupted publication.
-- **Duplicate delivery.** Persistent messages, publisher confirms, and late acknowledgments support recovery. The completion transaction prevents a second increment after acknowledgment is lost.
-- **Transient failures.** Connections retry with jitter and capped exponential delay; transient transactions retry. An infrastructure outage alone does not permanently fail a credit.
-- **Permanent failures.** Non-transient database errors become `failed` when persistable; unexpected errors remain pending and logged. Operators fix and requeue failures. Processed credits cannot be reopened.
+Saving to MongoDB and publishing to RabbitMQ are separate steps. A crash between them could otherwise leave a saved credit with no task in the queue.
 
-### Testing strategy and evidence
+I added a dispatcher that finds pending credits and republishes them after a 30-second lease expires. It can publish duplicates, so the worker still needs its transaction check. MongoDB holds the actual outcome; a Celery task ID does not prevent duplicate credits.
 
-- **Validation and API:** amount precision/limits, user IDs, acceptance, polling, conflicts, missing records, database unavailability, and failed publication.
-- **Transaction correctness:** real MongoDB tests cover concurrency, duplicate execution, aggregate status, failed-credit recovery, and rollback after an injected mid-transaction exception.
-- **Complete workflow:** concurrent requests cross real RabbitMQ, Celery, and MongoDB. **All 34 tests passed**, plus real worker/broker recovery checks. Post-commit redelivery was simulated; OS-level crash testing remains outstanding.
+Connection and temporary transaction failures retry. Non-transient database errors are marked `failed` if the database can save that outcome. Unexpected errors stay pending and are logged. A CLI command lets an operator requeue failures after fixing the cause.
 
-### Local operation
+### Tests I focused on
 
-- **Reproducible setup:** Docker Compose, a transaction-capable MongoDB replica set, health checks, persistent volumes, non-root application containers, and locked Python dependencies.
-- **Visible recovery:** logs use task IDs; the CLI reports pending/failed counts and oldest pending age. MongoDB determines API readiness. The dispatcher recovers broker outages once dependencies return.
+Beyond validation and the normal request flow, I focused on cases that could produce the wrong balance:
 
-### Trade-offs and production boundaries
+- Running the same credit repeatedly, including concurrent attempts.
+- Applying different credits to one user without losing an update.
+- Failing between the balance update and completion record, then checking rollback.
+- Recovering failed publication and keeping status correct when credits overlap.
 
-- **Queue traffic:** periodic republication can duplicate work already queued. At scale, add admission control, adaptive dispatch, queue-age alerts, and a refined outbox/reconciliation policy.
-- **Contention and latency:** transactions contend on busy accounts; driver retries can extend request time. Hard HTTP deadlines and measured capacity targets need additional design.
-- **Launch gates:** account authorization, tenant-scoped keys, TLS/secrets, replicated infrastructure, tested restores, reconciliation, SLOs, and failover drills. Local infrastructure is not highly available; payment rails, UI, and cloud deployment are outside scope.
+All **34 tests passed**, including an end-to-end test with real MongoDB, RabbitMQ, and Celery. Worker and broker stop-and-restart checks also passed. Replaying a committed credit was tested; killing a worker at the exact commit boundary was not.
+
+### Running it and what I would change next
+
+Docker Compose starts the services together so reviewers do not need to configure each dependency. MongoDB uses a single-node replica set for transactions. The README includes startup, sample requests, and test commands.
+
+The dispatcher is the main trade-off: recovery is simple, but waiting tasks can get published again. With more traffic, I would measure queue age and duplicate dispatches before adjusting that policy and adding admission limits.
+
+Before using this for real account balances, I would add account authorization, managed secrets, tested backups, and reconciliation. I would also test database failover and sustained load. Those are outside this local exercise's scope.
