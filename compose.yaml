@@ -1,0 +1,99 @@
+name: basta-credits
+
+x-app: &app
+  build:
+    context: .
+    target: runtime
+  environment: &environment
+    CREDIT_MONGO_URI: mongodb://mongo:27017/?replicaSet=rs0
+    CREDIT_MONGO_DATABASE: credits
+    CREDIT_BROKER_URL: amqp://credits:credits@rabbitmq:5672//
+    CREDIT_DISPATCH_LEASE_SECONDS: ${CREDIT_DISPATCH_LEASE_SECONDS:-30}
+  depends_on:
+    mongo-init:
+      condition: service_completed_successfully
+    rabbitmq:
+      condition: service_healthy
+  restart: unless-stopped
+  init: true
+
+services:
+  mongo:
+    image: mongo:7.0
+    command: ["mongod", "--replSet", "rs0", "--bind_ip_all"]
+    volumes: [mongo-data:/data/db]
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+    restart: unless-stopped
+
+  mongo-init:
+    image: mongo:7.0
+    depends_on:
+      mongo:
+        condition: service_healthy
+    entrypoint: ["mongosh", "--host", "mongo:27017", "--quiet", "--eval"]
+    command:
+      - |
+        try { rs.status(); } catch (e) {
+          if (e.codeName !== 'NotYetInitialized') throw e;
+          rs.initiate({_id: 'rs0', members: [{_id: 0, host: 'mongo:27017'}]});
+        }
+        let ready = false;
+        for (let i = 0; i < 60; i++) {
+          if (db.hello().isWritablePrimary) { ready = true; break; }
+          sleep(1000);
+        }
+        if (!ready) throw new Error('Replica set did not elect a primary');
+
+  rabbitmq:
+    image: rabbitmq:4.1-management
+    environment:
+      RABBITMQ_DEFAULT_USER: credits
+      RABBITMQ_DEFAULT_PASS: credits
+    volumes: [rabbitmq-data:/var/lib/rabbitmq]
+    ports: ["127.0.0.1:15672:15672"]
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+    restart: unless-stopped
+
+  api:
+    <<: *app
+    ports: ["127.0.0.1:${CREDIT_API_PORT:-8000}:8000"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/ready', timeout=5)"]
+      interval: 5s
+      timeout: 6s
+      retries: 20
+
+  worker:
+    <<: *app
+    command: ["celery", "-A", "credit_service.celery_app:celery_app", "worker", "--loglevel=INFO", "--concurrency=2"]
+    stop_grace_period: 30s
+
+  dispatcher:
+    <<: *app
+    command: ["python", "-m", "credit_service.dispatch"]
+
+  test:
+    build:
+      context: .
+      target: test
+    image: basta-credit-service:test
+    profiles: [test]
+    environment:
+      <<: *environment
+      CREDIT_MONGO_DATABASE: credits_test
+      CREDIT_API_URL: http://api:8000
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  mongo-data:
+  rabbitmq-data:
